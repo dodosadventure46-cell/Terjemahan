@@ -1,0 +1,550 @@
+name: Build Xianni Chat APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Buat project Flutter
+        run: flutter create --org com.dodosadventure --project-name xianni_chat --platforms android xianni_chat
+
+      - name: Pasang Firebase
+        working-directory: xianni_chat
+        env:
+          GSJ: ${{ secrets.GOOGLE_SERVICES_JSON }}
+        run: |
+          flutter pub add firebase_core firebase_auth cloud_firestore
+          printf '%s' "$GSJ" > android/app/google-services.json
+          python3 - <<'PY'
+          import re
+          p = 'android/settings.gradle.kts'
+          s = open(p).read()
+          s = re.sub(r'(\n\s*)(id\("org\.jetbrains\.kotlin\.android"\))',
+                     r'\1id("com.google.gms.google-services") version "4.4.2" apply false\1\2', s, 1)
+          open(p, 'w').write(s)
+          p = 'android/app/build.gradle.kts'
+          s = open(p).read()
+          s = s.replace('id("com.android.application")',
+                        'id("com.android.application")\n    id("com.google.gms.google-services")', 1)
+          s = s.replace('minSdk = flutter.minSdkVersion', 'minSdk = 23')
+          open(p, 'w').write(s)
+          PY
+          sed -i 's/android:label="[^"]*"/android:label="Xianni Chat"/' android/app/src/main/AndroidManifest.xml
+
+      - name: Tulis kode aplikasi
+        working-directory: xianni_chat
+        run: |
+          cat > lib/main.dart <<'EOF'
+          import 'dart:async';
+          import 'package:flutter/material.dart';
+          import 'package:firebase_core/firebase_core.dart';
+          import 'package:firebase_auth/firebase_auth.dart';
+          import 'package:cloud_firestore/cloud_firestore.dart';
+
+          Future<void> main() async {
+            WidgetsFlutterBinding.ensureInitialized();
+            await Firebase.initializeApp();
+            runApp(const XianniApp());
+          }
+
+          class XianniApp extends StatelessWidget {
+            const XianniApp({super.key});
+            @override
+            Widget build(BuildContext context) {
+              return MaterialApp(
+                title: 'Xianni Chat',
+                debugShowCheckedModeBanner: false,
+                theme: ThemeData(
+                  useMaterial3: true,
+                  colorScheme: ColorScheme.fromSeed(
+                    seedColor: const Color(0xFF1B8A6B),
+                    brightness: Brightness.dark,
+                  ),
+                ),
+                home: StreamBuilder<User?>(
+                  stream: FirebaseAuth.instance.authStateChanges(),
+                  builder: (context, snap) {
+                    if (snap.connectionState == ConnectionState.waiting) {
+                      return const Scaffold(body: Center(child: CircularProgressIndicator()));
+                    }
+                    return snap.hasData ? const UsersPage() : const AuthPage();
+                  },
+                ),
+              );
+            }
+          }
+
+          class AuthPage extends StatefulWidget {
+            const AuthPage({super.key});
+            @override
+            State<AuthPage> createState() => _AuthPageState();
+          }
+
+          class _AuthPageState extends State<AuthPage> {
+            final name = TextEditingController();
+            final email = TextEditingController();
+            final pass = TextEditingController();
+            bool register = false;
+            bool busy = false;
+
+            Future<void> submit() async {
+              setState(() => busy = true);
+              try {
+                final a = FirebaseAuth.instance;
+                if (register) {
+                  final cred = await a.createUserWithEmailAndPassword(
+                      email: email.text.trim(), password: pass.text);
+                  await cred.user!.updateDisplayName(name.text.trim());
+                  await FirebaseFirestore.instance.collection('users').doc(cred.user!.uid).set({
+                    'uid': cred.user!.uid,
+                    'name': name.text.trim(),
+                    'email': email.text.trim(),
+                  });
+                } else {
+                  await a.signInWithEmailAndPassword(
+                      email: email.text.trim(), password: pass.text);
+                }
+              } on FirebaseException catch (e) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context)
+                      .showSnackBar(SnackBar(content: Text(e.message ?? e.code)));
+                }
+              }
+              if (mounted) setState(() => busy = false);
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                body: Center(
+                  child: SingleChildScrollView(
+                    padding: const EdgeInsets.all(24),
+                    child: Column(
+                      children: [
+                        const Text('仙逆', style: TextStyle(fontSize: 52)),
+                        const Text('Xianni Chat',
+                            style: TextStyle(fontSize: 24, fontWeight: FontWeight.bold)),
+                        const SizedBox(height: 28),
+                        if (register) ...[
+                          TextField(
+                            controller: name,
+                            decoration: const InputDecoration(
+                                labelText: 'Nama', border: OutlineInputBorder()),
+                          ),
+                          const SizedBox(height: 12),
+                        ],
+                        TextField(
+                          controller: email,
+                          keyboardType: TextInputType.emailAddress,
+                          decoration: const InputDecoration(
+                              labelText: 'Email', border: OutlineInputBorder()),
+                        ),
+                        const SizedBox(height: 12),
+                        TextField(
+                          controller: pass,
+                          obscureText: true,
+                          decoration: const InputDecoration(
+                              labelText: 'Password (min 6)', border: OutlineInputBorder()),
+                        ),
+                        const SizedBox(height: 20),
+                        SizedBox(
+                          width: double.infinity,
+                          child: FilledButton(
+                            onPressed: busy ? null : submit,
+                            child: Text(register ? 'Daftar' : 'Masuk'),
+                          ),
+                        ),
+                        TextButton(
+                          onPressed: () => setState(() => register = !register),
+                          child: Text(register ? 'Sudah punya akun? Masuk' : 'Belum punya akun? Daftar'),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              );
+            }
+          }
+
+          class UsersPage extends StatefulWidget {
+            const UsersPage({super.key});
+            @override
+            State<UsersPage> createState() => _UsersPageState();
+          }
+
+          class _UsersPageState extends State<UsersPage> with WidgetsBindingObserver {
+            final me = FirebaseAuth.instance.currentUser!;
+            final Stream<QuerySnapshot<Map<String, dynamic>>> _users =
+                FirebaseFirestore.instance.collection('users').snapshots();
+            Timer? _beat;
+            Timer? _tick;
+
+            DocumentReference<Map<String, dynamic>> get myDoc =>
+                FirebaseFirestore.instance.collection('users').doc(me.uid);
+
+            @override
+            void initState() {
+              super.initState();
+              WidgetsBinding.instance.addObserver(this);
+              _saveMe();
+              _startBeat();
+              _tick = Timer.periodic(const Duration(seconds: 15), (_) {
+                if (mounted) setState(() {});
+              });
+            }
+
+            @override
+            void dispose() {
+              WidgetsBinding.instance.removeObserver(this);
+              _beat?.cancel();
+              _tick?.cancel();
+              super.dispose();
+            }
+
+            void _startBeat() {
+              _beat?.cancel();
+              _beat = Timer.periodic(const Duration(seconds: 30), (_) => _ping(true));
+            }
+
+            Future<void> _saveMe() async {
+              try {
+                await myDoc.set({
+                  'uid': me.uid,
+                  'name': me.displayName ?? '',
+                  'email': me.email ?? '',
+                  'online': true,
+                  'lastSeen': FieldValue.serverTimestamp(),
+                }, SetOptions(merge: true));
+              } catch (e) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context)
+                      .showSnackBar(SnackBar(content: Text('Gagal simpan profil: $e')));
+                }
+              }
+            }
+
+            Future<void> _ping(bool on) async {
+              try {
+                await myDoc.set(
+                    {'online': on, 'lastSeen': FieldValue.serverTimestamp()}, SetOptions(merge: true));
+              } catch (_) {}
+            }
+
+            @override
+            void didChangeAppLifecycleState(AppLifecycleState s) {
+              if (s == AppLifecycleState.resumed) {
+                _ping(true);
+                _startBeat();
+              } else {
+                _beat?.cancel();
+                _ping(false);
+              }
+            }
+
+            Future<void> _logout() async {
+              await _ping(false);
+              await FirebaseAuth.instance.signOut();
+            }
+
+            bool _active(String id, Map<String, dynamic> u) {
+              if (id == me.uid) return true;
+              if (u['online'] != true) return false;
+              final t = u['lastSeen'];
+              if (t is! Timestamp) return false;
+              return DateTime.now().difference(t.toDate()).inSeconds < 75;
+            }
+
+            Widget _stat(IconData icon, Color color, String label, int n) {
+              return ListTile(
+                leading: Icon(icon, color: color),
+                title: Text(label),
+                trailing: Text('$n', style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+              );
+            }
+
+            Widget _drawer(List<QueryDocumentSnapshot<Map<String, dynamic>>> all) {
+              final total = all.length;
+              final aktif = all.where((d) => _active(d.id, d.data())).length;
+              return Drawer(
+                child: ListView(
+                  padding: EdgeInsets.zero,
+                  children: [
+                    UserAccountsDrawerHeader(
+                      accountName: Text(me.displayName ?? 'Pengguna'),
+                      accountEmail: Text(me.email ?? ''),
+                      currentAccountPicture: CircleAvatar(
+                        child: Text(((me.displayName ?? me.email ?? '?').isEmpty
+                                ? '?'
+                                : (me.displayName ?? me.email ?? '?')[0])
+                            .toUpperCase()),
+                      ),
+                    ),
+                    _stat(Icons.groups, Colors.lightBlueAccent, 'Total user', total),
+                    _stat(Icons.circle, Colors.greenAccent, 'User aktif', aktif),
+                    _stat(Icons.circle, Colors.grey, 'User offline', total - aktif),
+                    const Divider(),
+                    ListTile(
+                      leading: const Icon(Icons.settings),
+                      title: const Text('Pengaturan'),
+                      onTap: () {
+                        Navigator.pop(context);
+                        Navigator.push(
+                          context,
+                          MaterialPageRoute(builder: (_) => SettingsPage(onLogout: _logout)),
+                        );
+                      },
+                    ),
+                    ListTile(
+                      leading: const Icon(Icons.logout),
+                      title: const Text('Keluar'),
+                      onTap: _logout,
+                    ),
+                  ],
+                ),
+              );
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                stream: _users,
+                builder: (context, snap) {
+                  final all = snap.data?.docs ?? [];
+                  Widget body;
+                  if (snap.hasError) {
+                    body = Center(
+                      child: Padding(
+                        padding: const EdgeInsets.all(24),
+                        child: Text('Error: ${snap.error}'),
+                      ),
+                    );
+                  } else if (!snap.hasData) {
+                    body = const Center(child: CircularProgressIndicator());
+                  } else {
+                    final docs = all.where((d) => d.id != me.uid).toList();
+                    docs.sort((a, b) {
+                      final x = _active(a.id, a.data()) ? 0 : 1;
+                      final y = _active(b.id, b.data()) ? 0 : 1;
+                      return x.compareTo(y);
+                    });
+                    if (docs.isEmpty) {
+                      body = const Center(child: Text('Belum ada pengguna lain'));
+                    } else {
+                      body = ListView.builder(
+                        itemCount: docs.length,
+                        itemBuilder: (context, i) {
+                          final u = docs[i].data();
+                          final raw = (u['name'] ?? '').toString();
+                          final nm = raw.isEmpty ? (u['email'] ?? '?').toString() : raw;
+                          final on = _active(docs[i].id, u);
+                          return ListTile(
+                            leading: CircleAvatar(child: Text(nm.isEmpty ? '?' : nm[0].toUpperCase())),
+                            title: Text(nm),
+                            subtitle: Text(on ? 'Online' : 'Offline'),
+                            trailing: Icon(Icons.circle,
+                                size: 12, color: on ? Colors.greenAccent : Colors.grey),
+                            onTap: () => Navigator.push(
+                              context,
+                              MaterialPageRoute(
+                                builder: (_) => ChatPage(peerId: docs[i].id, peerName: nm),
+                              ),
+                            ),
+                          );
+                        },
+                      );
+                    }
+                  }
+                  return Scaffold(
+                    appBar: AppBar(title: const Text('Xianni Chat')),
+                    drawer: _drawer(all),
+                    body: body,
+                  );
+                },
+              );
+            }
+          }
+
+          class SettingsPage extends StatefulWidget {
+            final Future<void> Function() onLogout;
+            const SettingsPage({super.key, required this.onLogout});
+            @override
+            State<SettingsPage> createState() => _SettingsPageState();
+          }
+
+          class _SettingsPageState extends State<SettingsPage> {
+            final me = FirebaseAuth.instance.currentUser!;
+            late final TextEditingController ctrl =
+                TextEditingController(text: me.displayName ?? '');
+
+            Future<void> save() async {
+              final n = ctrl.text.trim();
+              if (n.isEmpty) return;
+              try {
+                await me.updateDisplayName(n);
+                await FirebaseFirestore.instance
+                    .collection('users')
+                    .doc(me.uid)
+                    .set({'name': n}, SetOptions(merge: true));
+                if (mounted) {
+                  ScaffoldMessenger.of(context)
+                      .showSnackBar(const SnackBar(content: Text('Nama disimpan')));
+                }
+              } catch (e) {
+                if (mounted) {
+                  ScaffoldMessenger.of(context).showSnackBar(SnackBar(content: Text('Gagal: $e')));
+                }
+              }
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              return Scaffold(
+                appBar: AppBar(title: const Text('Pengaturan')),
+                body: ListView(
+                  padding: const EdgeInsets.all(16),
+                  children: [
+                    ListTile(
+                      leading: const Icon(Icons.email),
+                      title: const Text('Email'),
+                      subtitle: Text(me.email ?? '-'),
+                    ),
+                    const SizedBox(height: 8),
+                    TextField(
+                      controller: ctrl,
+                      decoration: const InputDecoration(
+                          labelText: 'Nama tampilan', border: OutlineInputBorder()),
+                    ),
+                    const SizedBox(height: 12),
+                    FilledButton(onPressed: save, child: const Text('Simpan nama')),
+                    const SizedBox(height: 24),
+                    OutlinedButton.icon(
+                      onPressed: () async {
+                        Navigator.pop(context);
+                        await widget.onLogout();
+                      },
+                      icon: const Icon(Icons.logout),
+                      label: const Text('Keluar'),
+                    ),
+                    const SizedBox(height: 24),
+                    const Center(child: Text('Xianni Chat 仙逆')),
+                  ],
+                ),
+              );
+            }
+          }
+
+          class ChatPage extends StatefulWidget {
+            final String peerId;
+            final String peerName;
+            const ChatPage({super.key, required this.peerId, required this.peerName});
+            @override
+            State<ChatPage> createState() => _ChatPageState();
+          }
+
+          class _ChatPageState extends State<ChatPage> {
+            final ctrl = TextEditingController();
+            final me = FirebaseAuth.instance.currentUser!;
+
+            String get chatId {
+              final ids = [me.uid, widget.peerId]..sort();
+              return ids.join('_');
+            }
+
+            CollectionReference<Map<String, dynamic>> get col => FirebaseFirestore.instance
+                .collection('chats')
+                .doc(chatId)
+                .collection('messages');
+
+            Future<void> send() async {
+              final t = ctrl.text.trim();
+              if (t.isEmpty) return;
+              ctrl.clear();
+              await col.add({'text': t, 'from': me.uid, 'time': FieldValue.serverTimestamp()});
+            }
+
+            @override
+            Widget build(BuildContext context) {
+              final cs = Theme.of(context).colorScheme;
+              return Scaffold(
+                appBar: AppBar(title: Text(widget.peerName)),
+                body: Column(
+                  children: [
+                    Expanded(
+                      child: StreamBuilder<QuerySnapshot<Map<String, dynamic>>>(
+                        stream: col.orderBy('time', descending: true).snapshots(),
+                        builder: (context, snap) {
+                          if (snap.hasError) return Center(child: Text('Error: ${snap.error}'));
+                          if (!snap.hasData) return const Center(child: CircularProgressIndicator());
+                          final docs = snap.data!.docs;
+                          return ListView.builder(
+                            reverse: true,
+                            itemCount: docs.length,
+                            itemBuilder: (context, i) {
+                              final m = docs[i].data();
+                              final mine = m['from'] == me.uid;
+                              return Align(
+                                alignment: mine ? Alignment.centerRight : Alignment.centerLeft,
+                                child: Container(
+                                  margin: const EdgeInsets.symmetric(horizontal: 12, vertical: 3),
+                                  padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 9),
+                                  constraints: BoxConstraints(
+                                      maxWidth: MediaQuery.of(context).size.width * 0.75),
+                                  decoration: BoxDecoration(
+                                    color: mine ? cs.primaryContainer : cs.surfaceContainerHighest,
+                                    borderRadius: BorderRadius.circular(16),
+                                  ),
+                                  child: Text((m['text'] ?? '').toString()),
+                                ),
+                              );
+                            },
+                          );
+                        },
+                      ),
+                    ),
+                    SafeArea(
+                      child: Padding(
+                        padding: const EdgeInsets.fromLTRB(12, 6, 6, 6),
+                        child: Row(
+                          children: [
+                            Expanded(
+                              child: TextField(
+                                controller: ctrl,
+                                onSubmitted: (_) => send(),
+                                decoration: const InputDecoration(
+                                    hintText: 'Ketik pesan...', border: OutlineInputBorder()),
+                              ),
+                            ),
+                            IconButton(icon: const Icon(Icons.send), onPressed: send),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              );
+            }
+          }
+          EOF
+
+      - name: Build APK
+        working-directory: xianni_chat
+        run: flutter build apk --release
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: XianniChat-APK
+          path: xianni_chat/build/app/outputs/flutter-apk/app-release.apk
